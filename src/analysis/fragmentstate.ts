@@ -38,8 +38,18 @@ import {MaybeEmptyPropertyRead} from "../patching/patchdynamics";
 import {getEnclosingNonArrowFunction, isInTryBlockOrBranch} from "../misc/asthelpers";
 import {isAbsoluteModuleName, isLocalRequire, resolveModule} from "../misc/files";
 import {ArrayMap, ArrayMapMap, ArrayMapSet} from "../misc/arraymap";
+import {SpillEnv, SpilledIntSetStore} from "../misc/spillstore";
 
 export type ListenerID = bigint;
+
+/**
+ * Sentinel stored in place of a token/listener set that has been migrated to the disk store
+ * (spill mode). The actual members live in the SpilledIntSetStore under the owner's index.
+ */
+export class Spilled {
+    static readonly instance = new Spilled;
+    private constructor() {}
+}
 
 /**
  * A RepresentativeVar is a constraint variable that is statically guaranteed to be its own representative (see below for exceptions).
@@ -92,8 +102,27 @@ export class FragmentState {
     /**
      * The current analysis solution.
      * Singleton sets are represented as plain references, larger sets are represented as ES2015 sets.
+     * In spill mode, sets that grow past --spill-threshold are migrated to the disk store and
+     * the slot holds the Spilled sentinel (members live in spilledTokens under the var's index).
      */
-    private readonly tokens: ArrayMap<ConstraintVar, RVT, Token | Set<Token>>;
+    private readonly tokens: ArrayMap<ConstraintVar, RVT, Token | Set<Token> | Spilled>;
+
+    /**
+     * Disk-backed storage for large points-to sets (spill mode only):
+     * per-variable sets of token indices in LMDB, resolved through a.tokens.
+     */
+    private readonly spilledTokens: SpilledIntSetStore | undefined;
+
+    /**
+     * Disk-backed storage for large listener-processed sets (spill mode only),
+     * keyed by a dense listener number (see listenerIdIndex), members are token indices.
+     */
+    private readonly spilledListenersProcessed: SpilledIntSetStore | undefined;
+
+    /** Dense numbering of listeners whose processed set has been spilled. */
+    private readonly listenerIdIndex: Map<ListenerID, number> = new Map;
+
+    private static fragmentCount = 0;
 
     /**
      * The set of constraint variables (including those with tokens, subset edges, or listeners, but excluding those that are redirected).
@@ -124,7 +153,7 @@ export class FragmentState {
 
     readonly tokenListeners2: ArrayMapMap<ConstraintVar, RVT, ListenerID, (t: Token) => void>;
 
-    readonly listenersProcessed: Map<ListenerID, Set<Token>> = new Map;
+    readonly listenersProcessed: Map<ListenerID, Set<Token> | Spilled> = new Map;
 
     readonly externalCallbacksProcessed: Set<FunctionToken> = new Set;
 
@@ -361,6 +390,11 @@ export class FragmentState {
         this.a = s.globalState;
         this.varProducer = new ConstraintVarProducer(s, s.globalState);
         this.tokens = new ArrayMap(this.a.vars);
+        if (SpillEnv.isEnabled()) {
+            const n = FragmentState.fragmentCount++;
+            this.spilledTokens = SpillEnv.openStore(`tokens-${n}`);
+            this.spilledListenersProcessed = SpillEnv.openStore(`listeners-${n}`);
+        }
         this.subsetEdges = new ArrayMapSet(this.a.vars);
         this.reverseSubsetEdges = new ArrayMapSet(this.a.vars);
         this.tokenListeners = new ArrayMapMap(this.a.vars);
@@ -677,10 +711,21 @@ export class FragmentState {
             if (ts) {
                 if (ts instanceof Token)
                     return [ts];
+                if (ts instanceof Spilled)
+                    return this.resolveTokens(this.spilledTokens!.getSet(v.index));
                 return ts;
             }
         }
         return [];
+    }
+
+    /**
+     * Lazily maps a live set of token indices to tokens (spill mode).
+     */
+    private *resolveTokens(s: Set<number>): Iterable<Token> {
+        const toks = this.a.tokens;
+        for (const i of s)
+            yield toks[i];
     }
 
     private static emptyTokensSize: [number, Iterable<Token>] = [0, []];
@@ -694,6 +739,10 @@ export class FragmentState {
             if (ts) {
                 if (ts instanceof Token)
                     return [1, [ts]];
+                if (ts instanceof Spilled) {
+                    const s = this.spilledTokens!.getSet(v.index);
+                    return [s.size, this.resolveTokens(s)];
+                }
                 return [ts.size, ts];
             }
         }
@@ -704,10 +753,14 @@ export class FragmentState {
      * Returns all constraint variables with their tokens and number of tokens.
      */
     *getAllVarsAndTokens(): Iterable<[RVT, Set<Token> | Array<Token>, number]> {
+        const toks = this.a.tokens;
         for (const [v, ts] of this.tokens)
             if (ts instanceof Token)
                 yield [v as RVT, [ts], 1];
-            else
+            else if (ts instanceof Spilled) {
+                const s = this.spilledTokens!.getSet((v as RVT).index);
+                yield [v as RVT, Array.from(s, i => toks[i]), s.size];
+            } else
                 yield [v as RVT, ts, ts.size];
     }
 
@@ -722,6 +775,10 @@ export class FragmentState {
             if (ts) {
                 if (ts instanceof Token)
                     return [1, (t: Token) => ts === t];
+                if (ts instanceof Spilled) {
+                    const s = this.spilledTokens!.getSet(v.index);
+                    return [s.size, (t: Token) => s.has(t.index)];
+                }
                 return [ts.size, (t: Token) => ts.has(t)];
             }
         }
@@ -746,9 +803,9 @@ export class FragmentState {
      * Returns the maximum number of tokens of all constraint variables.
      */
     getLargestTokenSetSize(): number {
-        let c = 0;
-        for (const v of this.tokens.values()) {
-            const s = v instanceof Token ? 1 : v.size;
+        let c = this.spilledTokens ? this.spilledTokens.largest() : 0;
+        for (const ts of this.tokens.values()) {
+            const s = ts instanceof Token ? 1 : ts instanceof Spilled ? 0 : ts.size;
             if (s > c)
                 c = s;
         }
@@ -770,6 +827,8 @@ export class FragmentState {
      * Removes all tokens from the given variable.
      */
     deleteVar(v: RVT) {
+        if (this.tokens.get(v) instanceof Spilled)
+            this.spilledTokens!.delete(v.index);
         this.tokens.delete(v);
     }
 
@@ -782,8 +841,21 @@ export class FragmentState {
             return false;
         else if (ts instanceof Token)
             return ts === t;
+        else if (ts instanceof Spilled)
+            return this.spilledTokens!.contains(v.index, t.index);
         else
             return ts.has(t);
+    }
+
+    /**
+     * Migrates a heap token set to the disk store (spill mode, set has reached the threshold).
+     */
+    private migrate(v: RVT, ts: Set<Token>) {
+        const s = new Set<number>();
+        for (const t of ts)
+            s.add(t.index);
+        this.spilledTokens!.adopt(v.index, s);
+        this.tokens.set(v, Spilled.instance);
     }
 
     /**
@@ -800,10 +872,15 @@ export class FragmentState {
             if (ts === t)
                 return false;
             this.tokens.set(v, new Set([ts, t]));
+        } else if (ts instanceof Spilled) {
+            if (!this.spilledTokens!.add(v.index, t.index))
+                return false;
         } else {
             if (ts.has(t))
                 return false;
             ts.add(t);
+            if (this.spilledTokens && ts.size >= options.spillThreshold)
+                this.migrate(v, ts);
         }
         this.numberOfTokens++;
         return true;
@@ -829,15 +906,51 @@ export class FragmentState {
                     this.tokens.set(v, vs);
                     add = true;
                 }
+            } else if (vs instanceof Spilled) {
+                add = this.spilledTokens!.add(v.index, t.index);
             } else if (!vs.has(t)) {
                 vs.add(t);
                 add = true;
+                if (this.spilledTokens && vs.size >= options.spillThreshold) {
+                    this.migrate(v, vs);
+                    vs = Spilled.instance;
+                }
             }
             if (add)
                 added.push(t);
         }
         this.numberOfTokens += added.length;
         return added;
+    }
+
+    /**
+     * Records that the given listener has processed the given token.
+     * @return true if it had not been processed before, false otherwise
+     */
+    listenerProcessed(id: ListenerID, t: Token): boolean {
+        const s = this.listenersProcessed.get(id);
+        if (s instanceof Spilled)
+            return this.spilledListenersProcessed!.add(this.listenerIdIndex.get(id)!, t.index);
+        if (!s) {
+            this.listenersProcessed.set(id, new Set([t]));
+            return true;
+        }
+        if (s.has(t))
+            return false;
+        s.add(t);
+        if (this.spilledListenersProcessed && s.size >= options.spillThreshold) {
+            let li = this.listenerIdIndex.get(id);
+            if (li === undefined) {
+                li = this.listenerIdIndex.size;
+                this.listenerIdIndex.set(id, li);
+            }
+            const si = new Set<number>();
+            for (const x of s)
+                si.add(x.index);
+            this.spilledListenersProcessed.adopt(li, si);
+            this.listenersProcessed.set(id, Spilled.instance);
+        }
+        return true;
     }
 
     /**

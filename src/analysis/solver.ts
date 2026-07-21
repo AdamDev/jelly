@@ -23,7 +23,6 @@ import {
     isArrayIndex,
     locationToStringWithFileAndEnd,
     mapGetMap,
-    mapGetSet,
     nodeToString,
     pushArraySingle,
     strHash,
@@ -401,9 +400,7 @@ export default class Solver {
      * Enqueues a call to a (non-bounded) token listener if it hasn't been done before.
      */
     private callTokenListener(id: ListenerID, listener: (t: Token) => void, t: Token, now?: boolean) {
-        const s = mapGetSet(this.fragmentState.listenersProcessed, id);
-        if (!s.has(t)) {
-            s.add(t);
+        if (this.fragmentState.listenerProcessed(id, t)) {
             if (now)
                 listener(t);
             else {
@@ -417,9 +414,7 @@ export default class Solver {
      * Enqueues a call to a (bounded) token listener if it hasn't been done before.
      */
     private callTokenListener2(id: ListenerID, listener: (t: Token) => void, t: Token) { // FIXME: no longer ignoring bounded listeners in module phase!!
-        const s = mapGetSet(this.fragmentState.listenersProcessed, id);
-        if (!s.has(t)) {
-            s.add(t);
+        if (this.fragmentState.listenerProcessed(id, t)) {
             this.enqueueListenerCall2([listener, t]);
             this.diagnostics.tokenListener2Notifications++;
         }

@@ -234,3 +234,36 @@ To enable source map transformation of stack traces, prefix commands by:
 ```bash
 NODE_OPTIONS=--enable-source-maps
 ```
+
+## Disk spill mode (fork addition)
+
+This fork adds an opt-in **disk spill mode** that bounds V8 heap usage on programs whose
+points-to state explodes (the usual cause of `JavaScript heap out of memory` on large
+dependency trees, even with `--max-old-space-size` in the tens of GB).
+
+```bash
+jelly --spill /tmp/jelly-scratch [--spill-threshold 256] [--spill-cache-size 4000000] ...
+```
+
+**How it works.** Token objects and constraint variables stay in the heap (they grow
+linearly), but the *sets* — per-variable points-to sets and per-listener processed sets,
+whose total membership grows superlinearly — are moved to an [LMDB](https://www.symas.com/lmdb)
+store (memory-mapped disk, synchronous access) once they exceed `--spill-threshold` members.
+Small sets keep the stock representation, so overhead on non-pathological programs is ~zero.
+A front cache of decoded sets (bounded by `--spill-cache-size` total members) serves the
+solver's hot loop; dirty sets are written back on eviction. The scratch directory is
+deleted on exit.
+
+**Measured** (Apple silicon, Node 25): on a synthetic points-to blowup with ~40M set
+memberships, stock needs ~2.5 GB and dies at a 1 GB heap cap, while spill mode completes
+at the same 1 GB cap (~9× slower under heavy cache thrash) and produces an **identical
+call graph**. On `@babel/core` (a workload dominated by ASTs, not sets), spill mode at the
+default threshold matches stock's memory floor with no measurable overhead — and no benefit,
+which is expected.
+
+**Limitations.** Only the superlinear structures are spilled; ASTs, canonicalization
+tables, subset edges, listener closures and call maps still grow linearly with program
+size, so spill mode raises the practical ceiling — it does not remove it. Combine with
+sharded analysis for the largest inputs. Slowdown depends on how much the solver's working
+set exceeds the cache; tune `--spill-cache-size` (bigger is not always better: larger
+eviction waves can cost more than they save).
