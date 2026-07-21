@@ -135,6 +135,15 @@ export class AnalysisStateReporter {
                 fs.writeSync(fd, `${first ? "" : ","}\n  "${funIndex}": ${JSON.stringify(this.makeLocStr(fileIndex, fun.loc))}`);
                 first = false;
             }
+        // fork addition: optional map funIndex -> function name (anonymous functions and
+        // module-level functions are omitted; consumers fall back to location-derived labels)
+        fs.writeSync(fd, `\n },\n "names": {`);
+        first = true;
+        for (const [fun, funIndex] of functionIndices)
+            if (fun instanceof FunctionInfo && fun.name) {
+                fs.writeSync(fd, `${first ? "" : ","}\n  "${funIndex}": ${JSON.stringify(fun.name)}`);
+                first = false;
+            }
         fs.writeSync(fd, `\n },\n "calls": {`);
         const callIndices = new Map<Node, number>();
         first = true;
