@@ -55,6 +55,13 @@ export class SpillEnv {
 
     static cleanup() {
         try {
+            // Force-commit any queued async write-backs before closing the env.
+            for (const s of SpillEnv.stores)
+                s.drain();
+        } catch {
+            /* ignore */
+        }
+        try {
             SpillEnv.env?.close();
         } catch {
             /* ignore */
@@ -128,10 +135,16 @@ export class SpilledIntSetStore {
         const set = new Set<number>();
         const buf = this.db.getBinary(id);
         if (buf) {
+            // Bulk-decode via a Uint32Array view instead of an element-by-element DataView
+            // loop. LMDB buffers are little-endian in our encoding; on (universally) LE hosts
+            // the view maps directly. If the byteOffset is not 4-byte aligned (Uint32Array
+            // requires alignment), fall back to a one-shot copy into an aligned buffer.
             const n = buf.byteLength >>> 2;
-            const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+            const u32 = (buf.byteOffset & 3) === 0
+                ? new Uint32Array(buf.buffer, buf.byteOffset, n)
+                : new Uint32Array(Uint8Array.prototype.slice.call(buf, 0, n << 2).buffer);
             for (let i = 0; i < n; i++)
-                set.add(view.getUint32(i << 2, true));
+                set.add(u32[i]);
         }
         e = {set, dirty: false};
         this.cache.set(id, e);
@@ -144,26 +157,55 @@ export class SpilledIntSetStore {
         const cap = options.spillCacheSize;
         if (this.cachedMembers <= cap)
             return;
-        // evict from LRU end until at ~half capacity, writing back dirty entries
+        // evict from LRU end until at ~half capacity, writing back dirty entries.
+        //
+        // Dirty write-backs use LMDB's ASYNC put(): it enqueues into LMDB's internal batched
+        // write transaction (auto-committed off the hot path) instead of forcing one full
+        // write-txn commit per set as putSync did — the per-set commit was the dominant cost
+        // under cache thrash. Correctness is preserved because lmdb-js gives read-your-writes:
+        // a later load()/getBinary() for an evicted id sees the queued value even before it
+        // reaches disk. We drain (drain()) at cleanup to guarantee everything is committed.
+        // (Explicit transactionSync batching is intentionally avoided — it is unreliable in
+        // some sandboxed/embedded environments; async put needs no explicit transaction.)
         const target = cap >>> 1;
         for (const [id, e] of this.cache) {
             if (this.cachedMembers <= target)
                 break;
-            if (e.dirty)
-                this.flush(id, e.set);
+            if (e.dirty) {
+                void this.db.put(id, SpilledIntSetStore.encode(e.set));
+                this.pendingWrites = true;
+            }
             this.cache.delete(id);
             this.cachedMembers -= e.set.size;
         }
     }
 
-    private flush(id: number, set: Set<number>) {
-        const buf = Buffer.allocUnsafe(set.size << 2);
+    /** True if async put()s have been queued but not yet force-committed via drain(). */
+    private pendingWrites = false;
+
+    /**
+     * Forces all queued async writes to commit. A single putSync (of a throwaway sentinel key
+     * that is immediately removed) flushes lmdb-js's pending async write batch synchronously.
+     * Cheap and only needed once, at store teardown / before durability matters.
+     */
+    drain() {
+        if (!this.pendingWrites)
+            return;
+        this.db.putSync(SpilledIntSetStore.DRAIN_KEY, SpilledIntSetStore.DRAIN_VALUE);
+        this.db.removeSync(SpilledIntSetStore.DRAIN_KEY);
+        this.pendingWrites = false;
+    }
+
+    private static readonly DRAIN_KEY = 0xffffffff;
+    private static readonly DRAIN_VALUE = Buffer.from([0]);
+
+    /** Serializes a set to an insertion-ordered little-endian Uint32 buffer (bulk). */
+    private static encode(set: Set<number>): Buffer {
+        const u32 = new Uint32Array(set.size);
         let i = 0;
-        for (const x of set) {
-            buf.writeUInt32LE(x, i);
-            i += 4;
-        }
-        this.db.putSync(id, buf);
+        for (const x of set)
+            u32[i++] = x;
+        return Buffer.from(u32.buffer, u32.byteOffset, u32.byteLength);
     }
 
     /**

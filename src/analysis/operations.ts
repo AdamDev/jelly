@@ -159,13 +159,14 @@ export class Operations {
         if (componentVar) {
             const caller = this.a.getEnclosingFunctionOrModule(path);
             const f = this.solver.fragmentState; // (don't use in callbacks)
-            f.registerCall(path.node, caller, componentVar);
-            this.solver.addForAllTokensConstraint(componentVar, TokenListener.JSX_ELEMENT, path.node, (t: Token) => {
+            const node = path.node; // capture the Node, NOT the NodePath (see AST-retention note in AGENTS.md)
+            f.registerCall(node, caller, componentVar);
+            this.solver.addForAllTokensConstraint(componentVar, TokenListener.JSX_ELEMENT, node, (t: Token) => {
                 if (t instanceof AccessPathToken)
-                    this.solver.addAccessPath(new ComponentAccessPath(componentVar), this.solver.varProducer.nodeVar(path.node), path.node, caller, t.ap);
+                    this.solver.addAccessPath(new ComponentAccessPath(componentVar), this.solver.varProducer.nodeVar(node), node, caller, t.ap);
                 else if (t instanceof FunctionToken) {
                     const f = this.solver.fragmentState;
-                    f.registerCallEdge(path.node, caller, this.a.functionInfos.get(t.fun)!);
+                    f.registerCallEdge(node, caller, this.a.functionInfos.get(t.fun)!);
                     // TODO: model call using one object that has all attributes as properties, see tests/micro/jsx2.jsx
                 }
             });

@@ -623,10 +623,11 @@ export function visit(ast: File, op: Operations) {
                             // it's enticing to rewrite the AST to use Object.assign, but assign invokes setters on the target object
                             const enclosing = a.getEnclosingFunctionOrModule(path);
                             const argVar = vp.expVar(p.argument, path);
+                            const node = path.node; // capture the Node, NOT the NodePath (see AST-retention note in AGENTS.md)
                             solver.addForAllTokensConstraint(argVar, TokenListener.OBJECT_SPREAD, p, (t: Token) => {
                                 if (isObjectPropertyVarObj(t)) {
-                                    solver.addForAllObjectPropertiesConstraint(t, TokenListener.OBJECT_SPREAD, path.node, (prop: string) => {
-                                        solver.fragmentState.registerPropertyRead("read", undefined, argVar, undefined, prop, path.node, enclosing);
+                                    solver.addForAllObjectPropertiesConstraint(t, TokenListener.OBJECT_SPREAD, node, (prop: string) => {
+                                        solver.fragmentState.registerPropertyRead("read", undefined, argVar, undefined, prop, node, enclosing);
                                         op.readPropertyBound(t, prop, vp.objPropVar(ot, prop), {t: ot, s: prop});
                                     });
                                 }
@@ -706,15 +707,16 @@ export function visit(ast: File, op: Operations) {
                 // constraint: ∀ objects t ∈ ⟦import...⟧: ⟦t.p⟧ ⊆ ⟦x⟧ where p is the property and x is the local identifier
                 // for each import specifier
                 const encl = a.getEnclosingFunctionOrModule(path);
-                solver.addForAllTokensConstraint(vp.nodeVar(path.node), TokenListener.IMPORT_BASE, path.node, (t: Token) => {
-                    for (const imp of path.node.specifiers)
+                const node = path.node; // capture the Node, NOT the NodePath (see AST-retention note in AGENTS.md)
+                solver.addForAllTokensConstraint(vp.nodeVar(node), TokenListener.IMPORT_BASE, node, (t: Token) => {
+                    for (const imp of node.specifiers)
                         if (isImportSpecifier(imp) || isImportDefaultSpecifier(imp)) {
                             const prop = getImportName(imp);
                             const dst = solver.varProducer.nodeVar(imp.local);
                             if (t instanceof AllocationSiteToken || t instanceof FunctionToken || t instanceof NativeObjectToken || t instanceof PackageObjectToken)
                                 solver.addSubsetConstraint(solver.varProducer.objPropVar(t, prop), dst);
                             else if (t instanceof AccessPathToken) // TODO: treat as object along with other tokens above?
-                                solver.addAccessPath(new PropertyAccessPath(solver.varProducer.nodeVar(path.node), prop), dst, imp.local, encl, t.ap); // TODO: describe this constraint...
+                                solver.addAccessPath(new PropertyAccessPath(solver.varProducer.nodeVar(node), prop), dst, imp.local, encl, t.ap); // TODO: describe this constraint...
                         }
                 });
             }

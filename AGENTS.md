@@ -73,10 +73,30 @@ objects stay in the heap and sets store their **integer indices** (`Token.index`
 
 ## Known limitations / future work
 
-- Only the superlinear sets are spilled. ASTs, canonicalization maps, subset edges
-  (`subsetEdges`/`reverseSubsetEdges` — next candidate), and listener closures still grow
-  linearly in the heap, so very large repos can still OOM from those; combine with the
-  consumer's sharded analysis (see the Reachability workspace, ADR 0002).
+- **AST retention — not the spillable sets — is the real per-shard dominator** (measured on
+  vscode s50, `pocs/spill-memory-profile/RESULTS.md`: ~5 GB live at OOM — NodePath 534 MB /
+  Position+SourceLocation 728 MB / Node 330 MB / node-`parent` chain pinning ~30 GB of strings —
+  vs all solver `Set`s combined ~42 MB). The earlier "next candidate = `subsetEdges`" belief is
+  **disproven** for AST-heavy repos (spilling subset edges reclaims <200 MB). **Root cause
+  (confirmed by a second snapshot after a naive fix failed): the `@babel/traverse` NodePath /
+  Scope / Binding / TraversalContext graph is pinned by SOLVER LISTENER CLOSURES that capture a
+  `NodePath` (e.g. `operations.ts` `callComponent`/`callFunction` register
+  `addForAllTokensConstraint(..., (t) => { ... path ... })` callbacks that close over `path`).**
+  A post-`visit()` sweep that nulls `node.parent`/comments and clears Babel's path cache does
+  NOT help — the live closures hold the paths directly (verified: a second s50 snapshot still had
+  2.6M NodePaths, `NodePath via parentPath` 595 MB, `TraversalContext via context` 177 MB). The
+  fix is to stop deferred listeners from capturing a `NodePath` — hoist `const node = path.node`
+  out of the callback and reference only `node`. **Landed (all lossless, 2865/3520 preserved):**
+  `callComponent` (`operations.ts`), `IMPORT_BASE` and `OBJECT_SPREAD` (`astvisitor.ts`).
+  **Still open — the dominant one: the `CALL_*` listeners** (`operations.ts` `callFunction` →
+  `handleCall` → `callFunctionBound`, one per call expression). They cannot use a plain
+  `path.node` hoist because `callFunctionBound` needs a live `NodePath` at listener-firing time
+  (`getAdjustedCallNodePath`, `path.isNewExpression()`, `expVar(arg, path)`, native
+  `t.invoke({path})`). Removing that capture is a deeper refactor of the native-model API
+  (`NativeFunctionParams.path`) + `expVar`'s path dependency. Also audit
+  `FragmentState.maybeEmptyMethodCalls` (Map keyed by `Node`, held until `patchMethodCalls`).
+- Canonicalization maps and listener closures still grow linearly in the heap; combine with the
+  consumer's sharded analysis (see the Reachability workspace, ADR 0002) for very large repos.
 - `cg.json` carries no function names (stock schema: `functions` maps index →
   `"fileIdx:sl:sc:el:ec"`), although `FunctionInfo.name` exists in memory. A backwards-
   compatible extension would emit an optional top-level `"names": {funIndex: name}` map from
